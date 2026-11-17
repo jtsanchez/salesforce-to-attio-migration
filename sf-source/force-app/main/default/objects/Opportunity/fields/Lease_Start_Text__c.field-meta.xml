@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CustomField xmlns="http://soap.sforce.com/2006/04/metadata">
+    <fullName>Lease_Start_Text__c</fullName>
+    <label>Lease Start (Legacy Text)</label>
+    <description>Legacy free-text lease start date from the old system. Mixed formats.</description>
+    <type>Text</type>
+    <length>30</length>
+    <required>false</required>
+    <unique>false</unique>
+    <externalId>false</externalId>
+</CustomField>

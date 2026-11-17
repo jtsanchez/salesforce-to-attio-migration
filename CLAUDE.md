@@ -61,6 +61,18 @@ The `SEED-CX` contacts are generated after everything else so they don't change 
 - `describe()`, `query()` and `count()`
 - `API_VERSION`
 
+## Mapping (`migrate/mapping.yaml`)
+
+`migrate/mapping.yaml` is the spec that the transform and Attio load must implement. It covers:
+- Attio setup (enable Deals; the custom attributes)
+- field-by-field mapping, where every populated Salesforce field is either mapped or listed under `excluded` with a reason
+- named cleaning `transforms`
+- `dedupe` rules
+- `open_decisions`
+- `expected_counts` (e.g. 105 contacts become 84 people)
+
+When the extract changes, update the mapping. Check it by confirming every populated field in `data/raw/*.json` appears as a `source` or under `excluded`. PyYAML isn't installed in the repo; use a throwaway venv to parse the file.
+
 ## Extract (`migrate/extract_sf.py`)
 
 ```bash

@@ -1,0 +1,618 @@
+# Salesforce (source-sf) -> Attio mapping. Specification for transform.py and load_attio.py.
+#
+# Read top to bottom: attio_setup (what must exist in Attio first), objects (per-field
+# mapping), transforms (named cleaning rules referenced by fields), dedupe, orphans_and_gaps,
+# open_decisions, expected_counts.
+#
+# Conventions:
+#   source:    Salesforce API field name in data/raw/<object>.json
+#   target:    Attio attribute api_slug (standard unless listed under attio_setup.custom_attributes)
+#   transform: name of a rule under `transforms` (omitted = copy value as-is)
+#   excluded:  every non-empty source field that is deliberately not migrated, with the reason.
+#              Fields that are empty in the extract are not listed individually (see each object's
+#              `empty_fields_policy`).
+#   flag:      the record is written to data/review/flags.csv for a human to check; it is still loaded
+#              unless the rule says otherwise.
+
+version: 1
+
+meta:
+  source_org_alias: source-sf
+  source_extract: data/raw/manifest.json      # written against the extract of 2026-11-17 (319 records)
+  target: Attio REST API v2
+  attio_docs:
+    - https://docs.attio.com/docs/standard-objects/standard-objects-companies
+    - https://docs.attio.com/docs/standard-objects/standard-objects-people
+    - https://docs.attio.com/docs/standard-objects/standard-objects-deals
+    - https://docs.attio.com/rest-api/endpoint-reference/records/upsert-a-record.md
+    - https://docs.attio.com/rest-api/endpoint-reference/tasks/create-a-task.md
+  decided_by_reviewer:
+    - Every Account becomes a Company, including individual landlords (tagged landlord_type = Individual).
+    - Fuzzy duplicates (nickname, typo'd domain) are auto-merged and listed in data/review/merge_report.csv.
+    - Tenants do not keep the Salesforce link to their landlord's Account.
+
+# ---------------------------------------------------------------------------------------------
+# Attio workspace setup (must exist before any record is written)
+# ---------------------------------------------------------------------------------------------
+attio_setup:
+  enable_objects:
+    - deals                     # disabled by default in every workspace; an admin enables it in Settings > Objects
+  settings:
+    deals.value.currency: AUD   # deal value defaults to USD
+  workspace_member_from_env: ATTIO_DEFAULT_OWNER_EMAIL
+  # Deals.owner is required and Task.assignees is required; Salesforce has a single owner user
+  # (005fj00000SRTptAAH) for every record, so everything is assigned to this one Attio member.
+
+  custom_attributes:
+    companies:
+      # Attio does not allow new unique custom attributes on Companies; upsert matching on a
+      # non-unique attribute still works, and a value matching more than one record is rejected.
+      - {api_slug: salesforce_id, title: Salesforce ID, type: text, is_unique: false, is_multiselect: false}
+      - {api_slug: phone, title: Phone, type: phone-number, is_unique: false, is_multiselect: false}
+      - api_slug: landlord_type
+        title: Landlord type
+        type: select
+        is_multiselect: false
+        options: [Individual, Family trust, Company]
+      - {api_slug: sf_created_at, title: Created in Salesforce, type: timestamp, is_multiselect: false}
+    people:
+      - {api_slug: salesforce_id, title: Salesforce ID, type: text, is_unique: true, is_multiselect: false}
+      - {api_slug: merged_salesforce_ids, title: Merged Salesforce IDs, type: text, is_unique: false, is_multiselect: false}
+      - api_slug: crm_roles
+        title: CRM roles
+        type: select
+        is_multiselect: true      # a person can be both a landlord and a tenant
+        options: [Landlord, Tenant]
+      - {api_slug: sf_created_at, title: Created in Salesforce, type: timestamp, is_multiselect: false}
+    deals:
+      - {api_slug: salesforce_id, title: Salesforce ID, type: text, is_unique: true, is_multiselect: false}
+      - {api_slug: weekly_rent, title: Weekly rent, type: currency, config: {default_currency_code: AUD, display_type: symbol}}
+      - {api_slug: bond, title: Bond, type: currency, config: {default_currency_code: AUD, display_type: symbol}}
+      - {api_slug: lease_start_date, title: Lease start date, type: date}
+      - {api_slug: lease_start_legacy_text, title: Lease start (legacy text), type: text}
+      - {api_slug: property_address, title: Property address, type: location}
+      - api_slug: property_state
+        title: Property state
+        type: select
+        is_multiselect: false
+        options: [NSW, VIC, QLD, WA, SA, TAS, ACT, NT]
+      - api_slug: primary_tenant
+        title: Primary tenant
+        type: record-reference
+        is_multiselect: false
+        config: {allowed_objects: [people]}
+      - {api_slug: sf_stage, title: Salesforce stage, type: text}
+      - {api_slug: sf_close_date, title: Salesforce close date, type: date}   # Deals have no standard description/date field
+      - {api_slug: sf_created_at, title: Created in Salesforce, type: timestamp}
+
+# ---------------------------------------------------------------------------------------------
+# Object and field mapping
+# ---------------------------------------------------------------------------------------------
+objects:
+
+  Account:
+    target: companies
+    load: upsert                # PUT /v2/objects/companies/records?matching_attribute=salesforce_id
+    match_attribute: salesforce_id
+    source_count: 44
+    fields:
+      - {source: Id, target: salesforce_id}
+      - {source: Name, target: name}
+      - {source: Description, target: description}
+      - source: Description
+        target: landlord_type
+        transform: landlord_type_from_description
+      - source: Website
+        target: domains
+        transform: domain_from_website
+        notes: 6 of 44 filled. Companies without a domain are allowed.
+      - source: Phone
+        target: phone
+        transform: phone_e164
+      - source: [BillingStreet, BillingCity, BillingStateCode, BillingPostalCode, BillingCountryCode]
+        target: primary_location
+        transform: location_object
+        notes: 8 of 44 accounts have no billing address -> primary_location null.
+      - source: CreatedDate
+        target: sf_created_at
+        transform: sf_datetime
+    excluded:
+      BillingState: duplicate of BillingStateCode (state and country picklists are on)
+      BillingCountry: duplicate of BillingCountryCode
+      Seed_Key__c: test-data marker from seed/, meaningless outside this demo
+      OwnerId: single Salesforce user; ownership is not modelled on Attio companies
+      CreatedById: system audit field
+      LastModifiedDate: system audit field; Attio keeps its own history
+      LastModifiedById: system audit field
+      SystemModstamp: system audit field
+      LastActivityDate: derived by Salesforce from Tasks; Attio derives its own
+      LastViewedDate: per-user UI state
+      LastReferencedDate: per-user UI state
+      PhotoUrl: Salesforce-internal image path, not portable
+      CleanStatus: Data.com status, always Pending
+      IsCustomerPortal: Salesforce portal flag, not used by the agency
+    empty_fields_policy: >-
+      All other Account fields (Shipping*, Industry, demo custom fields CustomerPriority__c, SLA__c,
+      Active__c, NumberofLocations__c, UpsellOpportunity__c, SLASerialNumber__c, SLAExpirationDate__c)
+      are empty in the extract and are not migrated. Re-check this list if a later extract has values.
+
+  Contact:
+    target: people
+    load: upsert                # PUT /v2/objects/people/records?matching_attribute=salesforce_id
+    match_attribute: salesforce_id
+    before_mapping: dedupe      # see `dedupe`; the surviving record is mapped, losers are folded in
+    source_count: 105
+    fields:
+      - source: Id
+        target: salesforce_id
+        notes: The survivor's Id. Losers' Ids go to merged_salesforce_ids.
+      - source: [FirstName, LastName]
+        target: name
+        transform: person_name
+      - source: Email
+        target: email_addresses
+        transform: email_list
+        notes: >-
+          Unique in Attio, so duplicates MUST be merged first. Union of the survivor's and losers'
+          emails, lower-cased, typo'd domains removed (dedupe rule typo_domain).
+      - source: Phone
+        target: phone_numbers
+        transform: phone_e164
+        notes: Union of all merged records' phones, de-duplicated after normalising.
+      - source: [MailingStreet, MailingCity, MailingStateCode, MailingPostalCode, MailingCountryCode]
+        target: primary_location
+        transform: location_object
+      - source: Title
+        target: crm_roles
+        transform: crm_roles_from_title
+        notes: Title holds Landlord or Tenant in this org, not a job title, so job_title stays empty.
+      - source: AccountId
+        target: company
+        transform: landlord_company_only
+        notes: >-
+          Set only when the contact's role is Landlord. Tenants get no company (reviewer decision);
+          they reach their landlord through the tenancy deal. Contacts with no AccountId get no company.
+      - source: CreatedDate
+        target: sf_created_at
+        transform: sf_datetime
+        notes: The survivor's CreatedDate.
+    excluded:
+      Name: derived from FirstName + LastName
+      MailingState: duplicate of MailingStateCode
+      MailingCountry: duplicate of MailingCountryCode
+      Seed_Key__c: test-data marker from seed/
+      OwnerId: single Salesforce user
+      CreatedById: system audit field
+      LastModifiedDate: system audit field
+      LastModifiedById: system audit field
+      SystemModstamp: system audit field
+      LastActivityDate: derived by Salesforce
+      LastViewedDate: per-user UI state
+      LastReferencedDate: per-user UI state
+      PhotoUrl: Salesforce-internal image path
+      CleanStatus: Data.com status, always Pending
+    empty_fields_policy: >-
+      Other Contact fields (MobilePhone, Other*, Birthdate, demo custom fields Level__c, Languages__c)
+      are empty in the extract and are not migrated.
+
+  Opportunity:
+    target: deals
+    load: upsert                # PUT /v2/objects/deals/records?matching_attribute=salesforce_id
+    match_attribute: salesforce_id
+    source_count: 65
+    fields:
+      - {source: Id, target: salesforce_id}
+      - source: Name
+        target: name
+        notes: e.g. "129 Ironwood Ave, Southport QLD 4215 - Lease 2024"; kept verbatim.
+      - source: StageName
+        target: stage
+        transform: deal_stage
+      - {source: StageName, target: sf_stage}
+      - source: OwnerId
+        target: owner
+        transform: default_owner
+      - source: AccountId
+        target: associated_company
+        transform: company_by_salesforce_id
+      - source: Weekly_Rent__c
+        target: weekly_rent
+        transform: aud
+        notes: 3 of 65 blank -> null.
+      - source: Weekly_Rent__c
+        target: value
+        transform: annual_rent
+        notes: OPEN DECISION (see open_decisions.deal_value).
+      - source: Bond__c
+        target: bond
+        transform: aud
+        checks: [bond_check]
+        notes: 10 of 65 blank -> null. Values above 4 weeks' rent are flagged, not changed (5 in the extract).
+      - source: [Lease_Start_Date__c, Lease_Start_Text__c]
+        target: lease_start_date
+        transform: lease_start
+      - {source: Lease_Start_Text__c, target: lease_start_legacy_text}
+      - source: Name
+        target: property_address
+        transform: address_from_deal_name
+        notes: Opportunities have no address fields; the address only exists in Name and Description.
+      - source: [Property_State__c, Name]
+        target: property_state
+        transform: state_normalise
+      - source: CloseDate
+        target: sf_close_date
+      - source: CreatedDate
+        target: sf_created_at
+        transform: sf_datetime
+    relationships_from_other_objects:
+      associated_people: from OpportunityContactRole (all roles on the deal)
+      primary_tenant: from OpportunityContactRole where IsPrimary = true
+    excluded:
+      Description: '"Property: <address>" - same address as Name, captured in property_address'
+      ContactId: Salesforce copy of the primary contact role; OpportunityContactRole is the source of truth
+      Probability: derived from StageName
+      IsClosed: derived from StageName
+      IsWon: derived from StageName
+      ForecastCategory: derived from StageName
+      ForecastCategoryName: derived from StageName
+      FiscalQuarter: derived from CloseDate
+      FiscalYear: derived from CloseDate
+      Fiscal: derived from CloseDate
+      HasOpenActivity: derived from Tasks
+      HasOverdueTask: derived from Tasks
+      LastActivityDate: derived from Tasks
+      Seed_Key__c: test-data marker from seed/
+      CreatedById: system audit field
+      LastModifiedDate: system audit field
+      LastModifiedById: system audit field
+      SystemModstamp: system audit field
+    empty_fields_policy: >-
+      Other Opportunity fields (Amount, Type, LeadSource, NextStep, demo custom fields
+      DeliveryInstallationStatus__c, TrackingNumber__c, OrderNumber__c, CurrentGenerators__c,
+      MainCompetitors__c) are empty in the extract and are not migrated.
+
+  OpportunityContactRole:
+    target: none                # no Attio object; folded into deals as relationships
+    source_count: 55
+    fields:
+      - source: [OpportunityId, ContactId]
+        target: deals.associated_people
+        transform: person_by_salesforce_id
+        notes: >-
+          One link per role. ContactId is remapped through the dedupe merge map first, then pairs are
+          de-duplicated. Attio relationships carry no attributes, so the Role value is not kept per link.
+      - source: [OpportunityId, ContactId, IsPrimary]
+        target: deals.primary_tenant
+        transform: person_by_salesforce_id
+        notes: Only rows with IsPrimary = true. More than one primary on a deal -> flag, keep the oldest.
+      - source: Role
+        target: people.crm_roles
+        notes: Role (always "Tenant" here) adds Tenant to the linked person's crm_roles.
+    excluded:
+      Id: no Attio record to key
+      CreatedDate: relationship links have no timestamp in Attio
+      CreatedById: system audit field
+      LastModifiedDate: system audit field
+      LastModifiedById: system audit field
+      SystemModstamp: system audit field
+
+  Task:
+    target: tasks
+    load: create                # POST /v2/tasks; tasks have no matching attribute
+    idempotency: >-
+      data/load_state.json maps Task.Id -> Attio task_id. A task already in the map is updated
+      (PATCH /v2/tasks/{task_id}), never re-created.
+    source_count: 50
+    fields:
+      - source: [Priority, Subject, Description, Status]
+        target: content
+        transform: task_content
+      - {target: format, constant: plaintext}
+      - source: ActivityDate
+        target: deadline_at
+        transform: task_deadline
+        notes: 8 of 50 have no date -> deadline_at null.
+      - source: IsClosed
+        target: is_completed
+      - source: [WhatId, WhoId]
+        target: linked_records
+        transform: task_links
+      - source: OwnerId
+        target: assignees
+        transform: default_owner
+    excluded:
+      Id: kept only in data/load_state.json (tasks have no custom attributes)
+      AccountId: derived from WhatId; the linked deal already links the company
+      IsHighPriority: same information as Priority = High
+      TaskSubtype: always "Task"
+      CompletedDateTime: Attio has no completed-at field for tasks
+      Seed_Key__c: test-data marker from seed/
+      CreatedDate: tasks have no custom attributes to hold it
+      CreatedById: system audit field
+      LastModifiedDate: system audit field
+      LastModifiedById: system audit field
+      SystemModstamp: system audit field
+    empty_fields_policy: >-
+      Other Task fields (CallType, Recurrence*, ReminderDateTime, ...) are empty and not migrated.
+
+# ---------------------------------------------------------------------------------------------
+# Named transforms referenced above
+# ---------------------------------------------------------------------------------------------
+transforms:
+
+  phone_e164:
+    rule: >-
+      Remove spaces, brackets and dashes. Strip a leading "+61" or "61" (11 digits), or a leading "0".
+      What remains must be 9 digits starting with 4 (mobile) or 2, 3, 7, 8 (landline); prefix "+61".
+      Anything else -> omit the number and flag.
+    covers_all_source_formats:
+      - {in: 0491 570 156, out: '+61491570156'}
+      - {in: '+61 491 570 156', out: '+61491570156'}
+      - {in: '0491570156', out: '+61491570156'}
+      - {in: (02) 5550 1234, out: '+61255501234'}
+      - {in: '+61-2-5550-1234', out: '+61255501234'}
+    checked: All 127 phone values in the extract (accounts + contacts) normalise; 0 flags.
+
+  state_normalise:
+    rule: >-
+      Map Property_State__c through `aliases` (case-insensitive) to a state code. If blank, take the
+      state from the address parsed out of the deal Name. If both exist and disagree, the address wins
+      and the record is flagged.
+    aliases:
+      nsw: NSW
+      n.s.w.: NSW
+      new south wales: NSW
+      vic: VIC
+      victoria: VIC
+      qld: QLD
+      queensland: QLD
+      wa: WA
+      w.a.: WA
+      western australia: WA
+      sa: SA
+      sth aust: SA
+      south australia: SA
+      tas: TAS
+      tasmania: TAS
+      act: ACT
+      nt: NT
+    checked: >-
+      Extract has 8 legacy values (Victoria, Queensland, Sth Aust), 4 blanks (all derivable from the
+      address) and 0 conflicts with the address. Salesforce already folded case-only variants such as
+      "Qld" into "QLD", so only spelling variants survive.
+
+  lease_start:
+    rule: >-
+      If Lease_Start_Date__c is set, use it. Otherwise parse Lease_Start_Text__c with the formats below,
+      first match wins. Dates are day-first (Australian); never try month-first. Two-digit years are
+      20YY. A parsed date outside 2015-01-01 .. today + 1 year is rejected. No date -> null and flag.
+    formats_in_order:
+      - {pattern: 'YYYY-MM-DD', example: 2024-02-03}
+      - {pattern: 'D/MM/YYYY or DD/MM/YYYY', example: 3/02/2024}
+      - {pattern: 'DD.MM.YY', example: 03.02.24}
+      - {pattern: 'Mon D YYYY', example: Feb 3 2024}
+    checked: >-
+      Extract has 50 real dates, 10 text-only, 5 with neither -> 5 flags. The 10 text values use
+      YYYY-MM-DD, DD.MM.YY and Mon D YYYY; D/MM/YYYY does not occur in this extract but is kept
+      because the legacy system is known to produce it.
+
+  address_from_deal_name:
+    regex: '^(?P<street>[^,]+), (?P<suburb>.+) (?P<state>NSW|VIC|QLD|WA|SA|TAS|ACT|NT) (?P<postcode>\d{4}) - Lease \d{4}$'
+    output: >-
+      location with line_1 = street (unit numbers such as "22/215 Banksia St" kept as-is),
+      locality = suburb, region = state, postcode = postcode, country_code = AU; all other keys null
+      (Attio requires every location key in an object write). No match -> null and flag.
+    checked: All 65 deal names match; multi-word suburbs (Fortitude Valley, Sandy Bay) parse correctly.
+
+  location_object:
+    rule: >-
+      line_1 = Street, locality = City, region = StateCode, postcode = PostalCode,
+      country_code = CountryCode; line_2..line_4, latitude, longitude = null. If Street, City and
+      PostalCode are all blank, the whole attribute is null.
+
+  person_name:
+    rule: first_name = FirstName, last_name = LastName, full_name = "FirstName LastName" (trimmed).
+
+  email_list:
+    rule: Lower-case, drop blanks and typo'd addresses, de-duplicate, keep the survivor's email first.
+
+  domain_from_website:
+    rule: Lower-case; strip scheme, a leading "www." and any path. "www.harbourline.example.com" -> "harbourline.example.com".
+
+  landlord_type_from_description:
+    rule: '"Landlord (Individual)" -> Individual, "Landlord (Family trust)" -> Family trust, "Landlord (Company)" -> Company; anything else -> null.'
+    notes: The 4 pre-existing "Household" accounts have no such description -> null.
+
+  crm_roles_from_title:
+    rule: Title "Landlord" -> [Landlord]; "Tenant" -> [Tenant]; plus Tenant if the person has any OpportunityContactRole. Union across merged records.
+
+  landlord_company_only:
+    rule: If the person's crm_roles contains Landlord and the survivor has an AccountId, link that company; otherwise no company.
+
+  deal_stage:
+    map:
+      Prospecting: Lead
+      Qualification: Lead
+      Needs Analysis: In Progress
+      Value Proposition: In Progress
+      Id. Decision Makers: In Progress
+      Perception Analysis: In Progress
+      Proposal/Price Quote: In Progress
+      Negotiation/Review: In Progress
+      Closed Won: Won
+      Closed Lost: Lost
+    notes: >-
+      Attio's default deal stages. Only Prospecting, Negotiation/Review, Closed Won and Closed Lost occur
+      in the extract. See open_decisions.deal_stages.
+
+  aud:
+    rule: Number as an AUD currency value; blank -> null.
+
+  annual_rent:
+    rule: Weekly_Rent__c x 52 in AUD; blank -> null.
+
+  bond_check:
+    rule: If Bond__c > 4 x Weekly_Rent__c, flag "bond above 4 weeks' rent" (common legal cap); value is kept.
+
+  sf_datetime:
+    rule: Salesforce "2026-11-16T00:55:27.000+0000" -> ISO 8601 UTC "2026-11-16T00:55:27Z".
+
+  default_owner:
+    rule: The workspace member whose email is ATTIO_DEFAULT_OWNER_EMAIL (from .env).
+
+  company_by_salesforce_id:
+    rule: Record reference to the company whose salesforce_id equals the Account Id (looked up after companies are loaded).
+
+  person_by_salesforce_id:
+    rule: Remap the Contact Id through the dedupe merge map, then reference the person with that salesforce_id.
+
+  task_content:
+    rule: >-
+      "[High] " if Priority = High, then Subject; then "\n\n" + Description if present; then
+      "\n[SF status: <Status>]" if Status is not "Not Started" or "Completed". Truncate to 2000 chars (Attio limit).
+    example: "[High] Rent arrears follow-up\n\nTenant said they'd call back after 19/8/24\n[SF status: Deferred]"
+
+  task_deadline:
+    rule: ActivityDate at 09:00 Australian Eastern Standard Time (fixed +10:00) -> ISO 8601 timestamp; blank -> null.
+    notes: >-
+      A fixed offset avoids needing the tzdata package on Windows. During daylight saving, and for
+      WA/SA/NT properties, this is up to 2 hours off, which is harmless for a due date.
+
+  task_links:
+    rule: >-
+      [{target_object: deals, salesforce_id: WhatId}] plus [{target_object: people, salesforce_id: WhoId
+      remapped through dedupe}] when WhoId is set. Resolved to Attio record ids before the call.
+
+# ---------------------------------------------------------------------------------------------
+# Duplicate contacts (runs before Contact mapping)
+# ---------------------------------------------------------------------------------------------
+dedupe:
+  object: Contact
+  method: >-
+    Apply the rules in order, joining matches into groups (union-find, so A=B and B=C makes one group).
+    Each group becomes one Attio person. Every merge is written to data/review/merge_report.csv
+    (group, rule, survivor Id, loser Ids, kept values, dropped values) before anything is loaded.
+  never_merge_on_phone_alone: >-
+    The demo data reuses ACMA's 30 fictional mobile numbers across unrelated people, and real agencies see
+    shared household landlines, so a matching phone is only a signal when combined with a name rule.
+
+  rules:
+    - id: same_email
+      required: true            # Attio rejects a second person with the same email
+      match: Email equal, case-insensitive
+      expected_in_extract: 17 merges (15 simple duplicates + 2 same email on different accounts)
+
+    - id: nickname_same_phone
+      match: >-
+        Same LastName (case-insensitive), same E.164 phone, and FirstNames that are a nickname pair
+        from `nicknames` (either direction).
+      ambiguity_guard: >-
+        A nickname can map to several full names (Harry -> Henry or Harrison). If a contact matches
+        more than one candidate, do not merge it with any of them; flag it instead. Otherwise union-find
+        could chain two different people together through the shared nickname.
+      expected_in_extract: >-
+        2 merges (Tilly -> Matilda Chandra; Harry -> Henry Nakamura). Harrison Nakamura also exists but
+        has no phone, so Harry matches exactly one candidate.
+
+    - id: typo_domain
+      match: >-
+        Same FirstName + LastName + AccountId, identical email local part, and the two domains are
+        within Damerau-Levenshtein distance 2 (a swap of adjacent letters counts as one edit), where
+        exactly one domain is known-good.
+      known_good_domains: Domains used by 3 or more contacts in the extract (here example.com, example.net, example.org).
+      action: The typo'd address is dropped from email_addresses and listed in the merge report.
+      expected_in_extract: 2 merges (exmaple.ogr -> example.org needs the transposition-aware distance; example.nte -> example.net)
+
+  nicknames:                    # nickname: [full names]; extend as the real data needs
+    bill: [william]
+    will: [william]
+    harry: [henry, harrison]
+    tilly: [matilda]
+    ollie: [oliver]
+    lottie: [charlotte]
+    lachie: [lachlan]
+    immy: [imogen]
+    archie: [archibald]
+    leo: [leonard]
+    jon: [jonathan]
+
+  survivor:
+    choose: Oldest CreatedDate; ties broken by lowest Id.
+    first_name_rule_note: For nickname merges the full name wins even when the survivor carries the nickname.
+    observed: >-
+      15 of the 20 groups share an identical CreatedDate (loaded in one batch); the Id tie-break picks
+      the original record in all 20 groups.
+    fields:
+      default: Survivor's value; if blank, the first non-blank value from the losers (oldest first).
+      FirstName: The full name rather than the nickname (Matilda over Tilly).
+      Email: Union (see email_list).
+      Phone: Union after phone_e164.
+      Title: Union into crm_roles.
+      AccountId: >-
+        Survivor's AccountId. If losers have a different AccountId (rule same_email: 2 groups), record
+        it in the merge report; deals on that other account still reach the person through
+        OpportunityContactRole.
+    losers:
+      - Their Ids are written to merged_salesforce_ids (comma-separated).
+      - Every Task.WhoId and OpportunityContactRole.ContactId pointing at a loser is remapped to the survivor.
+
+  not_merged:
+    - Same full name with no matching email, phone or account (could be two people).
+    - The 4 pre-existing contacts (no merges found for them).
+
+# ---------------------------------------------------------------------------------------------
+# Orphans, gaps and data-quality handling
+# ---------------------------------------------------------------------------------------------
+orphans_and_gaps:
+  contacts_without_account: Loaded as people with no company (15 in the extract).
+  tenants_on_landlord_accounts: Company link dropped (reviewer decision); connected to the deal instead.
+  tasks_without_who: Linked to the deal only (6 in the extract).
+  tasks_without_date: deadline_at null (8).
+  deals_without_rent: weekly_rent and value null (3).
+  deals_without_bond: bond null (10).
+  deals_without_lease_date: lease_start_date null and flagged (5).
+  accounts_without_address: primary_location null (4 seeded + 4 pre-existing Household accounts).
+  contacts_without_email: Loaded; email_addresses empty (8).
+  bond_over_4_weeks: Flagged (bond_check); value kept.
+  pre_existing_records: The 4 Household accounts and 4 contacts migrate like any other (landlord_type null).
+
+# ---------------------------------------------------------------------------------------------
+# Open decisions for the reviewer
+# ---------------------------------------------------------------------------------------------
+open_decisions:
+  deal_value: >-
+    Proposed: value = weekly rent x 52 (annual rent, AUD), so pipeline totals mean something.
+    Alternatives: weekly rent, or leave value empty and rely on weekly_rent.
+  deal_stages: >-
+    Proposed: keep Attio's defaults (Lead / In Progress / Won / Lost), with the Salesforce stage in sf_stage.
+    Alternative: rename Attio's stages to property terms (Enquiry / Application / Leased / Fell through).
+  email_domain_auto_company: >-
+    Attio links people to companies from their email domain. Every email here is example.com/.net/.org,
+    so the load could create junk "example.com" companies. Test in a sandbox workspace first; if it
+    happens, decide whether to delete them after the load or switch the feature off.
+  created_dates: >-
+    Attio's created_at can't be set, so Salesforce CreatedDate is kept in sf_created_at
+    (companies, people, deals). Tasks have no custom attributes, so their CreatedDate is lost.
+  task_status_detail: >-
+    Attio tasks are only open or completed. Deferred / In Progress / Waiting on someone else are kept as
+    text in content. Acceptable?
+
+# ---------------------------------------------------------------------------------------------
+# What the transform must produce from the current extract (checked against data/raw)
+# ---------------------------------------------------------------------------------------------
+expected_counts:
+  companies: 44                 # = 44 Accounts (40 seeded + 4 pre-existing)
+  people: 84                    # = 105 Contacts - 17 same_email - 2 nickname_same_phone - 2 typo_domain
+  people_with_company: landlords only; exact number produced by the transform report
+  deals: 65                     # = 65 Opportunities
+  deal_people_links: 55         # = 55 OpportunityContactRoles; none point at a merged-away contact
+  deals_with_primary_tenant: 45 # = OpportunityContactRoles with IsPrimary = true
+  tasks: 50                     # = 50 Tasks
+  task_person_links: 44         # = 50 Tasks - 6 without WhoId
+  flags:
+    lease_start_missing: 5
+    bond_over_4_weeks: 5
+    nickname_ambiguous: 0
+    phone_unparseable: 0
+    address_unparseable: 0
+    state_conflict: 0
