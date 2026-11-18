@@ -28,7 +28,7 @@ meta:
     - https://docs.attio.com/rest-api/endpoint-reference/tasks/create-a-task.md
   decided_by_reviewer:
     - Every Account becomes a Company, including individual landlords (tagged landlord_type = Individual).
-    - Fuzzy duplicates (nickname, typo'd domain) are auto-merged and listed in data/review/merge_report.csv.
+    - Duplicates (same email, same name + phone, nickname + phone) are merged and every merge is flagged in data/transformed/review.csv.
     - Tenants do not keep the Salesforce link to their landlord's Account.
 
 # ---------------------------------------------------------------------------------------------
@@ -154,7 +154,7 @@ objects:
         transform: email_list
         notes: >-
           Unique in Attio, so duplicates MUST be merged first. Union of the survivor's and losers'
-          emails, lower-cased, typo'd domains removed (dedupe rule typo_domain).
+          emails, lower-cased, typo'd domains removed (dedupe.typo_email_cleanup).
       - source: Phone
         target: phone_numbers
         transform: phone_e164
@@ -170,7 +170,7 @@ objects:
         target: company
         transform: landlord_company_only
         notes: >-
-          Set only when the contact's role is Landlord. Tenants get no company (reviewer decision);
+          Set unless the contact is a tenant only. Tenants get no company (reviewer decision);
           they reach their landlord through the tenancy deal. Contacts with no AccountId get no company.
       - source: CreatedDate
         target: sf_created_at
@@ -222,7 +222,7 @@ objects:
       - source: Weekly_Rent__c
         target: value
         transform: annual_rent
-        notes: OPEN DECISION (see open_decisions.deal_value).
+        notes: Annual rent (resolved_decisions.deal_value).
       - source: Bond__c
         target: bond
         transform: aud
@@ -427,7 +427,9 @@ transforms:
     rule: Title "Landlord" -> [Landlord]; "Tenant" -> [Tenant]; plus Tenant if the person has any OpportunityContactRole. Union across merged records.
 
   landlord_company_only:
-    rule: If the person's crm_roles contains Landlord and the survivor has an AccountId, link that company; otherwise no company.
+    rule: >-
+      Link the survivor's AccountId as the company unless the person is a tenant only (crm_roles has Tenant
+      and not Landlord). Contacts with no role, such as the 4 pre-existing household contacts, keep their link.
 
   deal_stage:
     map:
@@ -443,7 +445,7 @@ transforms:
       Closed Lost: Lost
     notes: >-
       Attio's default deal stages. Only Prospecting, Negotiation/Review, Closed Won and Closed Lost occur
-      in the extract. See open_decisions.deal_stages.
+      in the extract. Attio defaults kept (resolved_decisions.deal_stages).
 
   aud:
     rule: Number as an AUD currency value; blank -> null.
@@ -490,8 +492,9 @@ dedupe:
   object: Contact
   method: >-
     Apply the rules in order, joining matches into groups (union-find, so A=B and B=C makes one group).
-    Each group becomes one Attio person. Every merge is written to data/review/merge_report.csv
-    (group, rule, survivor Id, loser Ids, kept values, dropped values) before anything is loaded.
+    Each group becomes one Attio person, and every merge is also flagged for review (reviewer decision
+    2026-11-18: merge and flag all). Merges are written to data/transformed/review.csv (group, rule,
+    survivor Id, loser Ids, kept values, dropped values) before anything is loaded.
   never_merge_on_phone_alone: >-
     The demo data reuses ACMA's 30 fictional mobile numbers across unrelated people, and real agencies see
     shared household landlines, so a matching phone is only a signal when combined with a name rule.
@@ -514,14 +517,23 @@ dedupe:
         2 merges (Tilly -> Matilda Chandra; Harry -> Henry Nakamura). Harrison Nakamura also exists but
         has no phone, so Harry matches exactly one candidate.
 
-    - id: typo_domain
-      match: >-
-        Same FirstName + LastName + AccountId, identical email local part, and the two domains are
-        within Damerau-Levenshtein distance 2 (a swap of adjacent letters counts as one edit), where
-        exactly one domain is known-good.
-      known_good_domains: Domains used by 3 or more contacts in the extract (here example.com, example.net, example.org).
-      action: The typo'd address is dropped from email_addresses and listed in the merge report.
-      expected_in_extract: 2 merges (exmaple.ogr -> example.org needs the transposition-aware distance; example.nte -> example.net)
+    - id: same_name_same_phone
+      match: Same FirstName + LastName (case-insensitive) and at least one identical E.164 phone.
+      expected_in_extract: >-
+        2 merges: the two typo'd-email-domain duplicates (same name, same number in another format).
+        Every other same-name pair is already merged by same_email.
+      notes: >-
+        Replaces the earlier typo_domain rule (reviewer's rule list, 2026-11-18). The typo'd address is
+        still removed during the merge by `typo_email_cleanup`.
+
+  typo_email_cleanup:
+    rule: >-
+      Within a merged group, drop an email whose domain is not known-good when another email in the group
+      has the same local part and a known-good domain within Damerau-Levenshtein distance 2 (a swap of
+      adjacent letters counts as one edit). Dropped addresses are listed in review.csv.
+    known_good_min_contacts: 3   # a domain used by this many contacts in the extract is known-good
+    max_distance: 2
+    expected_in_extract: 2 dropped (exmaple.ogr -> example.org, example.nte -> example.net)
 
   nicknames:                    # nickname: [full names]; extend as the real data needs
     bill: [william]
@@ -579,13 +591,12 @@ orphans_and_gaps:
 # ---------------------------------------------------------------------------------------------
 # Open decisions for the reviewer
 # ---------------------------------------------------------------------------------------------
+resolved_decisions:              # settled by the reviewer on 2026-11-18
+  deal_value: annual_rent        # value = Weekly_Rent__c x 52 (AUD). Alternative was weekly rent.
+  deal_stages: attio_defaults    # Lead / In Progress / Won / Lost via transforms.deal_stage; Salesforce stage kept in sf_stage.
+  duplicates: merge_and_flag     # every duplicate group is merged into one person and each merge is flagged in review.csv.
+
 open_decisions:
-  deal_value: >-
-    Proposed: value = weekly rent x 52 (annual rent, AUD), so pipeline totals mean something.
-    Alternatives: weekly rent, or leave value empty and rely on weekly_rent.
-  deal_stages: >-
-    Proposed: keep Attio's defaults (Lead / In Progress / Won / Lost), with the Salesforce stage in sf_stage.
-    Alternative: rename Attio's stages to property terms (Enquiry / Application / Leased / Fell through).
   email_domain_auto_company: >-
     Attio links people to companies from their email domain. Every email here is example.com/.net/.org,
     so the load could create junk "example.com" companies. Test in a sandbox workspace first; if it
@@ -602,7 +613,7 @@ open_decisions:
 # ---------------------------------------------------------------------------------------------
 expected_counts:
   companies: 44                 # = 44 Accounts (40 seeded + 4 pre-existing)
-  people: 84                    # = 105 Contacts - 17 same_email - 2 nickname_same_phone - 2 typo_domain
+  people: 84                    # = 105 Contacts - 17 same_email - 2 same_name_same_phone - 2 nickname_same_phone
   people_with_company: landlords only; exact number produced by the transform report
   deals: 65                     # = 65 Opportunities
   deal_people_links: 55         # = 55 OpportunityContactRoles; none point at a merged-away contact
