@@ -18,7 +18,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `lib/sfcli.py`: the shared `sf` CLI wrapper used by both `seed/` and `migrate/`.
 - `data/` (gitignored): extract and transform output.
 
-There is no Attio API code yet. Don't assume an architecture beyond what's described here.
+`migrate/load_attio.py` is the Attio loader. It has been **tested against mocked HTTP only**; see README.md "Attio loader" for the assumptions still unverified against a live workspace. Don't assume an architecture beyond what's described here.
 
 ## Python
 
@@ -96,6 +96,21 @@ When the extract changes, update the mapping. Check it by confirming every popul
   - `_migration`: source IDs, flags and orphan markers. This must never be sent to Attio.
 - **Review files:** `review.csv` has one row per flag. `report.md` covers records in and out, normalised, flagged, skipped, orphans, gaps, merged groups, and a check against `mapping.yaml` `expected_counts`.
 - **Tenants:** only contacts that are tenants and not landlords lose their Salesforce account link. Contacts with no role, such as the pre-existing household contacts, keep theirs.
+
+## Load (`migrate/load_attio.py`)
+
+```bash
+.venv/Scripts/python -I migrate/load_attio.py                    # dry run (default): no HTTP, no API key needed
+.venv/Scripts/python -I migrate/load_attio.py --apply [--accept-auto-company-risk] [--batch-size 50]
+```
+
+- **Dry run is the default.** It makes no requests and writes `data/load/dry_run_plan.json`. Only `--apply` touches Attio. It needs `ATTIO_API_KEY` and `ATTIO_DEFAULT_OWNER_EMAIL` from `.env` (template: `.env.example`).
+- **HTTP:** `urllib` sits behind an injectable `transport`. Tests pass a `FakeAttio` and block sockets, so a test must never use `urllib_transport`.
+- **Order:** pre-flight, then companies, people, deals (upsert with `matching_attribute=salesforce_id`), then tasks (POST, or PATCH when already in `data/load/state.json`), then the auto-company audit.
+- **Batching:** Attio has no bulk endpoint, so batching means checkpointing the state after each batch.
+- **Retries:** 429 waits for `Retry-After`, which is an HTTP date. 5xx, 408 and connection errors back off. Other 4xx errors are recorded and not retried.
+- **Auto-company guard:** `--apply` is blocked when people use reserved or shared non-company email domains, unless `--accept-auto-company-risk` is passed. The post-load audit writes `data/load/auto_companies.json` and never deletes anything.
+- **Exit codes:** 0 ok, 1 record failures or reference problems, 2 blocked by pre-flight.
 
 ## Extract (`migrate/extract_sf.py`)
 
