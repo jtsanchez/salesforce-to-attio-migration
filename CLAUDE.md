@@ -14,15 +14,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - `sf-source/`: Salesforce DX project holding the tenancy custom fields deployed to `source-sf`.
 - `seed/`: Python scripts that generate and load messy demo data into `source-sf`.
-- `migrate/`: migration stages. So far only the Salesforce extract (`extract_sf.py`) exists.
+- `migrate/`: migration stages: the Salesforce extract (`extract_sf.py`) and the offline transform (`transform.py`, with `normalise.py` and `dedupe.py`).
 - `lib/sfcli.py`: the shared `sf` CLI wrapper used by both `seed/` and `migrate/`.
-- `data/` (gitignored): extract output.
+- `data/` (gitignored): extract and transform output.
 
-There is no transform or Attio-side code yet. Don't assume an architecture beyond what's described here.
+There is no Attio API code yet. Don't assume an architecture beyond what's described here.
 
 ## Python
 
-Python 3.12 was installed with winget at `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`. Open a new shell before relying on `python` from PATH. Scripts use only the standard library. Run them with `python -I`; each script adds its own folder to `sys.path` so sibling imports still work.
+Python 3.12 was installed with winget at `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`. Open a new shell before relying on `python` from PATH. Run scripts with `python -I`; each script adds its own folder to `sys.path` so sibling imports still work.
+
+- `seed/` and `migrate/extract_sf.py` use only the standard library.
+- `migrate/transform.py` needs PyYAML to read `mapping.yaml`, and the tests use pytest. Both are pinned in `requirements.txt` and `requirements-dev.txt` and installed into a gitignored `.venv`:
+
+```bash
+python -m venv .venv && .venv/Scripts/python -m pip install -r requirements-dev.txt
+.venv/Scripts/python -I -m pytest            # all tests (pytest.ini sets pythonpath = migrate lib)
+.venv/Scripts/python -I -m pytest migrate/tests/test_normalise.py -k lease   # a subset
+```
 
 ## Source org data model (`source-sf`)
 
@@ -72,6 +81,21 @@ The `SEED-CX` contacts are generated after everything else so they don't change 
 - `expected_counts` (e.g. 105 contacts become 84 people)
 
 When the extract changes, update the mapping. Check it by confirming every populated field in `data/raw/*.json` appears as a `source` or under `excluded`. PyYAML isn't installed in the repo; use a throwaway venv to parse the file.
+
+## Transform (`migrate/transform.py`)
+
+```bash
+.venv/Scripts/python -I migrate/transform.py [--today YYYY-MM-DD]   # data/raw -> data/transformed; exits 1 if expected_counts don't match
+```
+
+- **Dry run only.** It makes no network calls and writes to no API. `test_transform.py` enforces this: it checks the imports of `transform.py`, `normalise.py` and `dedupe.py`, and runs the full transform with sockets and subprocesses blocked. Keep Attio API code in a separate loader.
+- **Code layout:** `normalise.py` holds the pure value rules (phones, states, lease dates, addresses). `dedupe.py` holds the duplicate rules: same email, same name + phone, nickname + phone with an ambiguity guard. Every duplicate group is merged and flagged.
+- **Output records:** `companies/people/deals/tasks.json`. Each record has:
+  - `values`: Attio attribute values
+  - `references`: links still keyed by Salesforce ID (or `default_owner`), which the loader resolves to Attio IDs
+  - `_migration`: source IDs, flags and orphan markers. This must never be sent to Attio.
+- **Review files:** `review.csv` has one row per flag. `report.md` covers records in and out, normalised, flagged, skipped, orphans, gaps, merged groups, and a check against `mapping.yaml` `expected_counts`.
+- **Tenants:** only contacts that are tenants and not landlords lose their Salesforce account link. Contacts with no role, such as the pre-existing household contacts, keep theirs.
 
 ## Extract (`migrate/extract_sf.py`)
 
